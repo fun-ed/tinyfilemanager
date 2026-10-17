@@ -1,0 +1,12 @@
+/.serena/
+/config.php
+/data/
+/.venv/
+/.omp/*
+!/.omp/agents/
+__pycache__/
+*.py[cod]
+*.log
+*.bak
+*.backup
+.DS_Store

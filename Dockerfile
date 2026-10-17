@@ -14,13 +14,16 @@ FROM php:7.4-cli-alpine
 
 RUN apk add --no-cache \
     libzip-dev \
-    oniguruma-dev
+    oniguruma-dev \
+    curl-dev \
+    curl
 
 RUN docker-php-ext-install \
-    zip 
+    zip curl
 
 WORKDIR /var/www/html
 
 COPY tinyfilemanager.php index.php
+COPY translation.json translation.json
 
 CMD ["sh", "-c", "php -S 0.0.0.0:80"]

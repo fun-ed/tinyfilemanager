@@ -8,7 +8,10 @@ services:
       - "8080:80"                               
     volumes:
       - ./data:/var/www/html/data                       ### You can change "./data:" to your path if you want to keep your data in a dedicated directory.  
-      - ./config.php:/var/www/html/config.php           ### Uncomment if you are using config.php
+      # Optional override: create this file before starting Compose.
+      # A single-file bind mount cannot be atomically replaced by the settings UI.
+      # Edit it on the host, or use a writable whole-application directory mount.
+      - ./config.php:/var/www/html/config.php
    
     environment:
       TZ: UTC

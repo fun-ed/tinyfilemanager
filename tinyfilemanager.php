@@ -277,6 +277,15 @@ if (empty($_SESSION['token'])) {
     }
 }
 
+// Parse JSON AJAX save requests before checking authentication
+$contentType = isset($_SERVER['CONTENT_TYPE']) ? $_SERVER['CONTENT_TYPE'] : '';
+if (stripos($contentType, 'application/json') !== false) {
+    $jsonPost = json_decode(file_get_contents('php://input'), true);
+    if (is_array($jsonPost) && !empty($jsonPost['ajax']) && isset($jsonPost['type']) && $jsonPost['type'] === 'save') {
+        $_POST = $jsonPost;
+    }
+}
+
 if (empty($auth_users)) {
     $use_auth = false;
 }
@@ -356,6 +365,10 @@ if ($use_auth) {
         sleep(1);
         if (function_exists('password_verify')) {
             if (isset($auth_users[$_POST['fm_usr']]) && isset($_POST['fm_pwd']) && password_verify($_POST['fm_pwd'], $auth_users[$_POST['fm_usr']]) && verifyToken($_POST['token'])) {
+                // Prevent session fixation: issue a fresh session id on successful login
+                // so a pre-authentication session cookie cannot be replayed afterwards.
+                session_regenerate_id(true);
+                unset($_SESSION['token']);
                 $_SESSION[FM_SESSION_ID]['logged'] = $_POST['fm_usr'];
                 fm_set_msg(lng('You are logged in'));
                 fm_redirect(FM_SELF_URL);
@@ -370,6 +383,12 @@ if ($use_auth) {
     } else {
         // Form
         unset($_SESSION[FM_SESSION_ID]['logged']);
+        if (!empty($_POST['ajax']) && isset($_POST['type']) && $_POST['type'] === 'save') {
+            header('HTTP/1.1 401 Unauthorized');
+            header('Content-Type: text/plain; charset=UTF-8');
+            header('Cache-Control: no-store');
+            die("Session expired. The file was not saved. Log in again in another tab, then click Save again.");
+        }
         fm_show_header_login();
 ?>
         <section class="h-100">
@@ -465,10 +484,6 @@ $p = isset($_GET['p']) ? $_GET['p'] : (isset($_POST['p']) ? $_POST['p'] : '');
 // clean path
 $p = fm_clean_path($p);
 
-// for ajax request - save
-$input = file_get_contents('php://input');
-$_POST = (strpos($input, 'ajax') != FALSE && strpos($input, 'save') != FALSE) ? json_decode($input, true) : $_POST;
-
 // instead globals vars
 define('FM_PATH', $p);
 define('FM_USE_AUTH', $use_auth);
@@ -485,6 +500,13 @@ unset($p, $use_auth, $iconv_input_encoding, $use_highlightjs, $highlightjs_style
 // Handle all AJAX Request
 if ((isset($_SESSION[FM_SESSION_ID]['logged'], $auth_users[$_SESSION[FM_SESSION_ID]['logged']]) || !FM_USE_AUTH) && isset($_POST['ajax'], $_POST['token'])) {
     if (!verifyToken($_POST['token'])) {
+        if (isset($_POST['type']) && $_POST['type'] === 'save') {
+            header('HTTP/1.1 409 Conflict');
+            header('Content-Type: text/plain; charset=UTF-8');
+            header('Cache-Control: no-store');
+            header('X-CSRF-Token: ' . $_SESSION['token']);
+            die("Invalid Token.");
+        }
         header('HTTP/1.0 401 Unauthorized');
         die("Invalid Token.");
     }
@@ -531,7 +553,10 @@ if ((isset($_SESSION[FM_SESSION_ID]['logged'], $auth_users[$_SESSION[FM_SESSION_
             header("HTTP/1.1 500 Internal Server Error");
             die("Could Not Write File! - Check Permissions / Ownership");
         }
-        die(true);
+        header('X-TFM-Save-Success: 1');
+        header('Content-Type: text/plain; charset=UTF-8');
+        header('Cache-Control: no-store');
+        die('1');
     }
 
     // backup files
@@ -597,7 +622,12 @@ if ((isset($_SESSION[FM_SESSION_ID]['logged'], $auth_users[$_SESSION[FM_SESSION_
             $cfg->data['theme'] = $te3;
             $theme = $te3;
         }
-        $cfg->save();
+        if (!$cfg->save()) {
+            http_response_code(500);
+            header('Content-Type: text/plain; charset=UTF-8');
+            echo 'Settings were not saved: unable to safely update the configuration file.';
+            exit();
+        }
         echo true;
     }
 
@@ -607,92 +637,72 @@ if ((isset($_SESSION[FM_SESSION_ID]['logged'], $auth_users[$_SESSION[FM_SESSION_
         echo $res;
     }
 
-    //upload using url
-    if (isset($_POST['type']) && $_POST['type'] == "upload" && !empty($_REQUEST["uploadurl"])) {
-        $path = FM_ROOT_PATH;
-        if (FM_PATH != '') {
-            $path .= '/' . FM_PATH;
-        }
-
-        function event_callback($message)
-        {
-            global $callback;
-            echo json_encode($message);
-        }
-
-        function get_file_path()
-        {
-            global $path, $fileinfo, $temp_file;
-            return $path . "/" . basename($fileinfo->name);
-        }
-
-        $url = !empty($_REQUEST["uploadurl"]) && preg_match("|^http(s)?://.+$|", stripslashes($_REQUEST["uploadurl"])) ? stripslashes($_REQUEST["uploadurl"]) : null;
-
-        //prevent 127.* domain and known ports
-        $domain = parse_url($url, PHP_URL_HOST);
-        $port = parse_url($url, PHP_URL_PORT);
-        $knownPorts = [22, 23, 25, 3306];
-
-        if (preg_match("/^localhost$|^127(?:\.[0-9]+){0,2}\.[0-9]+$|^(?:0*\:)*?:?0*1$/i", $domain) || in_array($port, $knownPorts)) {
-            $err = array("message" => "URL is not allowed");
-            event_callback(array("fail" => $err));
-            exit();
-        }
-
-        $use_curl = false;
-        $temp_file = tempnam(sys_get_temp_dir(), "upload-");
-        $fileinfo = new stdClass();
-        $fileinfo->name = trim(urldecode(basename($url)), ".\x00..\x20");
-
-        $allowed = (FM_UPLOAD_EXTENSION) ? explode(',', FM_UPLOAD_EXTENSION) : false;
-        $ext = strtolower(pathinfo($fileinfo->name, PATHINFO_EXTENSION));
-        $isFileAllowed = ($allowed) ? in_array($ext, $allowed) : true;
-
-        $err = false;
-
-        if (!$isFileAllowed) {
-            $err = array("message" => "File extension is not allowed");
-            event_callback(array("fail" => $err));
-            exit();
-        }
-
-        if (!$url) {
-            $success = false;
-        } else if ($use_curl) {
-            @$fp = fopen($temp_file, "w");
-            @$ch = curl_init($url);
-            curl_setopt($ch, CURLOPT_NOPROGRESS, false);
-            curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
-            curl_setopt($ch, CURLOPT_FILE, $fp);
-            @$success = curl_exec($ch);
-            $curl_info = curl_getinfo($ch);
-            if (!$success) {
-                $err = array("message" => curl_error($ch));
-            }
-            @curl_close($ch);
-            fclose($fp);
-            $fileinfo->size = $curl_info["size_download"];
-            $fileinfo->type = $curl_info["content_type"];
+    // Upload from a validated public HTTP(S) URL.
+    if (isset($_POST['type']) && $_POST['type'] === 'upload' && isset($_POST['uploadurl'])) {
+        $sendUrlUploadResponse = function ($response) {
+            header('Content-Type: application/json; charset=UTF-8');
+            echo json_encode($response);
+        };
+        $failUrlUpload = function ($message) use ($sendUrlUploadResponse) {
+            $sendUrlUploadResponse(array('fail' => array('message' => $message)));
+        };
+        $url = $_POST['uploadurl'];
+        if (!is_string($url) || $url === '') {
+            $failUrlUpload('Invalid URL.');
+        } elseif (!function_exists('curl_init')) {
+            $failUrlUpload('URL uploads require the PHP cURL extension.');
         } else {
-            $ctx = stream_context_create();
-            @$success = copy($url, $temp_file, $ctx);
-            if (!$success) {
-                $err = error_get_last();
+            $filename = fm_url_upload_filename($url, FM_UPLOAD_EXTENSION ? FM_UPLOAD_EXTENSION : false);
+            if ($filename === false) {
+                $failUrlUpload('Invalid filename or file extension is not allowed.');
+            } else {
+                $details = null;
+                $urlError = '';
+                if (!fm_validate_remote_url($url, $details, $urlError)) {
+                    $failUrlUpload($urlError);
+                } else {
+                    $directory = FM_ROOT_PATH;
+                    if (FM_PATH != '') {
+                        $directory .= '/' . FM_PATH;
+                    }
+                    if (!is_dir($directory) || !fm_upload_path_is_safe(FM_ROOT_PATH, $directory)) {
+                        $failUrlUpload('Upload destination is outside the configured root or unavailable.');
+                    } else {
+                        $directory = realpath($directory);
+                        $target = $directory . '/' . $filename;
+                        if (!is_writable($directory)) {
+                            $failUrlUpload('The upload destination is not writable.');
+                        } elseif (is_link($target) || !fm_upload_path_is_safe(FM_ROOT_PATH, $directory, $target)) {
+                            $failUrlUpload('Upload target is not a safe file path.');
+                        } else {
+                            $tempFile = @tempnam($directory, '.url-upload-');
+                            if ($tempFile === false || realpath(dirname($tempFile)) !== $directory) {
+                                if ($tempFile !== false) {
+                                    @unlink($tempFile);
+                                }
+                                $failUrlUpload('Unable to create a safe temporary download file.');
+                            } else {
+                                $downloadInfo = array();
+                                $downloadError = '';
+                                $maxBytes = max(0, min((int) MAX_UPLOAD_SIZE, 104857600));
+                                if (!fm_fetch_url_to_file($url, $tempFile, $maxBytes, $downloadError, $downloadInfo)) {
+                                    @unlink($tempFile);
+                                    $failUrlUpload($downloadError);
+                                } elseif (!fm_upload_path_is_safe(FM_ROOT_PATH, $directory, $target) || !@rename($tempFile, $target)) {
+                                    @unlink($tempFile);
+                                    $failUrlUpload('Unable to safely save the downloaded file.');
+                                } else {
+                                    $sendUrlUploadResponse(array('done' => array(
+                                        'name' => $filename,
+                                        'size' => $downloadInfo['size'],
+                                        'type' => $downloadInfo['type']
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                }
             }
-        }
-
-        if ($success) {
-            $success = rename($temp_file, strtok(get_file_path(), '?'));
-        }
-
-        if ($success) {
-            event_callback(array("done" => $fileinfo));
-        } else {
-            unlink($temp_file);
-            if (!$err) {
-                $err = array("message" => "Invalid url parameter");
-            }
-            event_callback(array("fail" => $err));
         }
     }
     exit();
@@ -723,7 +733,7 @@ if (isset($_GET['del'], $_POST['token']) && !FM_READONLY) {
 
 // Create a new file/folder
 if (isset($_POST['newfilename'], $_POST['newfile'], $_POST['token']) && !FM_READONLY) {
-    $type = urldecode($_POST['newfile']);
+    $type = $_POST['newfile'];
     $new = str_replace('/', '', fm_clean_path(strip_tags($_POST['newfilename'])));
     if (fm_isvalid_filename($new) && $new != '' && $new != '..' && $new != '.' && verifyToken($_POST['token'])) {
         $path = FM_ROOT_PATH;
@@ -760,8 +770,7 @@ if (isset($_POST['newfilename'], $_POST['newfile'], $_POST['token']) && !FM_READ
 // Copy folder / file
 if (isset($_GET['copy'], $_GET['finish']) && !FM_READONLY) {
     // from
-    $copy = urldecode($_GET['copy']);
-    $copy = fm_clean_path($copy);
+    $copy = fm_clean_path($_GET['copy']);
     // empty path
     if ($copy == '') {
         fm_set_msg(lng('Source path not defined'), 'error');
@@ -778,7 +787,7 @@ if (isset($_GET['copy'], $_GET['finish']) && !FM_READONLY) {
     $dest .= '/' . basename($from);
     // move?
     $move = isset($_GET['move']);
-    $move = fm_clean_path(urldecode($move));
+
     // copy/move/duplicate
     if ($from != $dest) {
         $msg_from = trim(FM_PATH . '/' . basename($from), '/');
@@ -907,12 +916,10 @@ if (isset($_POST['rename_from'], $_POST['rename_to'], $_POST['token']) && !FM_RE
         die("Invalid Token.");
     }
     // old name
-    $old = urldecode($_POST['rename_from']);
-    $old = fm_clean_path($old);
+    $old = fm_clean_path($_POST['rename_from']);
     $old = str_replace('/', '', $old);
     // new name
-    $new = urldecode($_POST['rename_to']);
-    $new = fm_clean_path(strip_tags($new));
+    $new = fm_clean_path(strip_tags($_POST['rename_to']));
     $new = str_replace('/', '', $new);
     // path
     $path = FM_ROOT_PATH;
@@ -942,8 +949,7 @@ if (isset($_GET['dl'], $_POST['token'])) {
     }
 
     // Clean the download file path
-    $dl = urldecode($_GET['dl']);
-    $dl = fm_clean_path($dl);
+    $dl = fm_clean_path($_GET['dl']);
     $dl = str_replace('/', '', $dl); // Prevent directory traversal attacks
 
     // Define the file path
@@ -970,147 +976,194 @@ if (isset($_GET['dl'], $_POST['token'])) {
     }
 }
 
-// Upload
+// Multipart upload
 if (!empty($_FILES) && !FM_READONLY) {
-    if (isset($_POST['token'])) {
-        if (!verifyToken($_POST['token'])) {
-            $response = array('status' => 'error', 'info' => lng("Invalid Token."));
-            echo json_encode($response);
-            exit();
-        }
-    } else {
-        $response = array('status' => 'error', 'info' => "Token Missing.");
-        echo json_encode($response);
+    $uploadError = function ($message) {
+        echo json_encode(array('status' => 'error', 'info' => $message));
         exit();
+    };
+    if (!isset($_POST['token']) || !verifyToken($_POST['token'])) {
+        $uploadError(isset($_POST['token']) ? lng("Invalid Token.") : "Token Missing.");
+    }
+    if (!isset($_FILES['file']) || !is_array($_FILES['file'])) {
+        $uploadError('No uploaded file was received.');
     }
 
-    $chunkIndex = $_POST['dzchunkindex'];
-    $chunkTotal = $_POST['dztotalchunkcount'];
-    $fullPathInput = fm_clean_path($_REQUEST['fullpath']);
+    $file = $_FILES['file'];
+    $filename = isset($file['name']) && is_string($file['name']) ? $file['name'] : '';
+    $tmpName = isset($file['tmp_name']) && is_string($file['tmp_name']) ? $file['tmp_name'] : '';
+    if ($filename === '' || strlen($filename) > 255 || $filename === '.' || $filename === '..' || strpbrk($filename, "/\\") !== false || preg_match('/[\x00-\x1f\x7f]/', $filename) || !fm_isvalid_filename($filename)) {
+        $uploadError('Invalid file name.');
+    }
+    $allowed = FM_UPLOAD_EXTENSION ? array_map('strtolower', array_map('trim', explode(',', FM_UPLOAD_EXTENSION))) : false;
+    $extension = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
+    if ($allowed && !in_array($extension, $allowed, true)) {
+        $uploadError('File extension is not allowed.');
+    }
+    if (!isset($file['error']) || (int) $file['error'] !== UPLOAD_ERR_OK || $tmpName === '' || $tmpName === 'none') {
+        $uploadError('The uploaded file could not be received.');
+    }
 
-    $f = $_FILES;
-    $path = FM_ROOT_PATH;
-    $ds = DIRECTORY_SEPARATOR;
+    $fullPathInput = isset($_POST['fullpath']) ? $_POST['fullpath'] : $filename;
+    if (!is_string($fullPathInput)) {
+        $uploadError('Invalid upload path.');
+    }
+    if ($fullPathInput === '') {
+        $fullPathInput = $filename;
+    }
+    $fullPathInput = str_replace('\\', '/', $fullPathInput);
+    if (strlen($fullPathInput) > 4096 || substr($fullPathInput, 0, 1) === '/' || preg_match('/^[a-zA-Z]:/', $fullPathInput) || preg_match('/[\x00-\x1f\x7f]/', $fullPathInput)) {
+        $uploadError('Invalid upload path.');
+    }
+    $pathParts = explode('/', $fullPathInput);
+    foreach ($pathParts as $part) {
+        if ($part === '' || strlen($part) > 255 || $part === '.' || $part === '..' || !fm_isvalid_filename($part)) {
+            $uploadError('Invalid upload path.');
+        }
+    }
+    $directories = count($pathParts) > 1 ? array_slice($pathParts, 0, -1) : array();
+
+    $chunkIndexRaw = isset($_POST['dzchunkindex']) ? $_POST['dzchunkindex'] : '0';
+    $chunkTotalRaw = isset($_POST['dztotalchunkcount']) ? $_POST['dztotalchunkcount'] : '0';
+    if (!is_scalar($chunkIndexRaw) || !is_scalar($chunkTotalRaw) || !ctype_digit((string) $chunkIndexRaw) || !ctype_digit((string) $chunkTotalRaw)) {
+        $uploadError('Invalid chunk metadata.');
+    }
+    $chunkIndex = (int) $chunkIndexRaw;
+    $chunkTotal = (int) $chunkTotalRaw;
+    if (($chunkTotal === 0 && $chunkIndex !== 0) || ($chunkTotal > 0 && $chunkIndex >= $chunkTotal)) {
+        $uploadError('Invalid chunk metadata.');
+    }
+    $uploadId = isset($_POST['dzuuid']) ? $_POST['dzuuid'] : '';
+    if ($chunkTotal > 0 && (!is_string($uploadId) || !preg_match('/^[a-zA-Z0-9_-]{1,128}$/', $uploadId))) {
+        $uploadError('Invalid upload identity.');
+    }
+
+    $basePath = FM_ROOT_PATH;
     if (FM_PATH != '') {
-        $path .= '/' . FM_PATH;
+        $basePath .= '/' . FM_PATH;
+    }
+    if (!is_dir($basePath) || !fm_upload_path_is_safe(FM_ROOT_PATH, $basePath)) {
+        $uploadError('Upload destination is outside the configured root or unavailable.');
+    }
+    $basePath = realpath($basePath);
+    $folder = $basePath . (count($directories) ? '/' . implode('/', $directories) : '');
+    $fullPath = $folder . '/' . $filename;
+    $partPath = $fullPath . '.part';
+    if (is_link($fullPath) || is_link($partPath) || !fm_upload_path_is_safe(FM_ROOT_PATH, $folder, $fullPath)) {
+        $uploadError('Upload target is not a safe file path.');
+    }
+    if (!is_dir($folder) && !@mkdir($folder, 0777, true)) {
+        $uploadError('Unable to create the upload folder.');
+    }
+    if (!fm_upload_path_is_safe(FM_ROOT_PATH, $folder, $fullPath)) {
+        $uploadError('Upload destination is outside the configured root.');
+    }
+    $folder = realpath($folder);
+    $fullPath = $folder . '/' . $filename;
+    $partPath = $fullPath . '.part';
+    if (!is_writable($folder) || is_link($fullPath) || is_link($partPath)) {
+        $uploadError('The upload destination is not writable or safe.');
     }
 
-    $errors = 0;
-    $uploads = 0;
-    $allowed = (FM_UPLOAD_EXTENSION) ? explode(',', FM_UPLOAD_EXTENSION) : false;
-    $response = array(
-        'status' => 'error',
-        'info'   => 'Oops! Try again'
-    );
-
-    $filename = $f['file']['name'];
-    $tmp_name = $f['file']['tmp_name'];
-    $ext = pathinfo($filename, PATHINFO_FILENAME) != '' ? strtolower(pathinfo($filename, PATHINFO_EXTENSION)) : '';
-    $isFileAllowed = ($allowed) ? in_array($ext, $allowed) : true;
-
-    if (!fm_isvalid_filename($filename) && !fm_isvalid_filename($fullPathInput)) {
-        $response = array(
-            'status'    => 'error',
-            'info'      => "Invalid File name!",
-        );
-        echo json_encode($response);
-        exit();
-    }
-
-    $targetPath = $path . $ds;
-    if (is_writable($targetPath)) {
-        $fullPath = $path . '/' . $fullPathInput;
-        $folder = substr($fullPath, 0, strrpos($fullPath, "/"));
-
-        if (!is_dir($folder)) {
-            $old = umask(0);
-            mkdir($folder, 0777, true);
-            umask($old);
+    if ($chunkTotal > 0) {
+        $chunkKey = hash('sha256', $partPath);
+        $state = isset($_SESSION[FM_SESSION_ID]['uploads'][$chunkKey]) ? $_SESSION[FM_SESSION_ID]['uploads'][$chunkKey] : null;
+        if ($chunkIndex === 0) {
+            if ($state !== null && !file_exists($partPath) && !is_link($partPath)) {
+                unset($_SESSION[FM_SESSION_ID]['uploads'][$chunkKey]);
+                $state = null;
+            }
+            if ($state !== null) {
+                $uploadError('Another upload is already in progress for this file.');
+            }
+            $state = array('id' => $uploadId, 'next' => 0, 'total' => $chunkTotal, 'bytes' => 0);
+        } elseif (!is_array($state) || $state['id'] !== $uploadId || $state['next'] !== $chunkIndex || $state['total'] !== $chunkTotal) {
+            $uploadError('Upload chunks are missing, out of order, or belong to another upload.');
         }
-
-        if (empty($f['file']['error']) && !empty($tmp_name) && $tmp_name != 'none' && $isFileAllowed) {
-            if ($chunkTotal) {
-                $out = @fopen("{$fullPath}.part", $chunkIndex == 0 ? "wb" : "ab");
-                if ($out) {
-                    $in = @fopen($tmp_name, "rb");
-                    if ($in) {
-                        if (PHP_VERSION_ID < 80009) {
-                            // workaround https://bugs.php.net/bug.php?id=81145
-                            do {
-                                for (;;) {
-                                    $buff = fread($in, 4096);
-                                    if ($buff === false || $buff === '') {
-                                        break;
-                                    }
-                                    fwrite($out, $buff);
-                                }
-                            } while (!feof($in));
-                        } else {
-                            stream_copy_to_stream($in, $out);
-                        }
-                        $response = array(
-                            'status'    => 'success',
-                            'info' => "file upload successful"
-                        );
-                    } else {
-                        $response = array(
-                            'status'    => 'error',
-                            'info' => "failed to open output stream",
-                            'errorDetails' => error_get_last()
-                        );
-                    }
-                    @fclose($in);
-                    @fclose($out);
-                    @unlink($tmp_name);
-
-                    $response = array(
-                        'status'    => 'success',
-                        'info' => "file upload successful"
-                    );
-                } else {
-                    $response = array(
-                        'status'    => 'error',
-                        'info' => "failed to open output stream"
-                    );
+        $incomingSize = @filesize($tmpName);
+        if ($incomingSize === false || $incomingSize > max(0, (int) MAX_UPLOAD_SIZE - $state['bytes'])) {
+            unset($_SESSION[FM_SESSION_ID]['uploads'][$chunkKey]);
+            if ($chunkIndex > 0 && is_file($partPath) && !is_link($partPath) && @filesize($partPath) === $state['bytes']) {
+                @unlink($partPath);
+            }
+            $uploadError('The upload exceeds the configured size limit.');
+        }
+        $out = @fopen($partPath, $chunkIndex === 0 ? 'xb' : 'r+b');
+        if ($out === false) {
+            unset($_SESSION[FM_SESSION_ID]['uploads'][$chunkKey]);
+            $uploadError('Unable to exclusively open the partial upload file.');
+        }
+        if (@fseek($out, 0, SEEK_END) !== 0 || ftell($out) !== $state['bytes']) {
+            @fclose($out);
+            unset($_SESSION[FM_SESSION_ID]['uploads'][$chunkKey]);
+            $uploadError('The partial upload has changed unexpectedly.');
+        }
+        $_SESSION[FM_SESSION_ID]['uploads'][$chunkKey] = $state;
+        $in = @fopen($tmpName, 'rb');
+        if ($in === false) {
+            @fclose($out);
+            @unlink($partPath);
+            unset($_SESSION[FM_SESSION_ID]['uploads'][$chunkKey]);
+            $uploadError('Unable to read the uploaded file.');
+        }
+        $copied = true;
+        while (!feof($in)) {
+            $buffer = @fread($in, 8192);
+            if ($buffer === false) {
+                $copied = false;
+                break;
+            }
+            if ($buffer === '') {
+                if (!feof($in)) {
+                    $copied = false;
                 }
+                break;
+            }
+            $offset = 0;
+            $length = strlen($buffer);
+            while ($offset < $length) {
+                $written = @fwrite($out, substr($buffer, $offset));
+                if ($written === false || $written === 0) {
+                    $copied = false;
+                    break 2;
+                }
+                $offset += $written;
+            }
+        }
+        $totalBytes = ftell($out);
+        $flushed = @fflush($out);
+        $closedIn = @fclose($in);
+        $closedOut = @fclose($out);
+        @unlink($tmpName);
+        if (!$copied || !$flushed || !$closedIn || !$closedOut) {
+            @unlink($partPath);
+            unset($_SESSION[FM_SESSION_ID]['uploads'][$chunkKey]);
+            $uploadError('Unable to write the partial upload completely.');
+        }
+        $_SESSION[FM_SESSION_ID]['uploads'][$chunkKey]['next'] = $chunkIndex + 1;
+        $_SESSION[FM_SESSION_ID]['uploads'][$chunkKey]['bytes'] = $totalBytes;
 
-                if ($chunkIndex == $chunkTotal - 1) {
-                    if (file_exists($fullPath)) {
-                        $ext_1 = $ext ? '.' . $ext : '';
-                        $fullPathTarget = $path . '/' . basename($fullPathInput, $ext_1) . '_' . date('ymdHis') . $ext_1;
-                    } else {
-                        $fullPathTarget = $fullPath;
-                    }
-                    rename("{$fullPath}.part", $fullPathTarget);
-                }
-            } else if (move_uploaded_file($tmp_name, $fullPath)) {
-                // Be sure that the file has been uploaded
-                if (file_exists($fullPath)) {
-                    $response = array(
-                        'status'    => 'success',
-                        'info' => "file upload successful"
-                    );
-                } else {
-                    $response = array(
-                        'status' => 'error',
-                        'info'   => 'Couldn\'t upload the requested file.'
-                    );
-                }
-            } else {
-                $response = array(
-                    'status'    => 'error',
-                    'info'      => "Error while uploading files. Uploaded files $uploads",
-                );
+        if ($chunkIndex === $chunkTotal - 1) {
+            unset($_SESSION[FM_SESSION_ID]['uploads'][$chunkKey]);
+            $target = $fullPath;
+            if (file_exists($fullPath)) {
+                $singleDotfile = $filename[0] === '.' && strpos($filename, '.', 1) === false;
+                $extensionWithDot = !$singleDotfile && $extension !== '' ? substr($filename, -strlen($extension) - 1) : '';
+                $baseName = $extensionWithDot !== '' ? substr($filename, 0, -strlen($extensionWithDot)) : $filename;
+                $target = $folder . '/' . $baseName . '_' . date('ymdHis') . $extensionWithDot;
+            }
+            if (is_link($target) || file_exists($target) || !fm_upload_path_is_safe(FM_ROOT_PATH, $folder, $target) || !@rename($partPath, $target)) {
+                @unlink($partPath);
+                $uploadError('Unable to safely finalize the uploaded file.');
             }
         }
     } else {
-        $response = array(
-            'status' => 'error',
-            'info'   => 'The specified folder for upload isn\'t writeable.'
-        );
+        if (!@move_uploaded_file($tmpName, $fullPath) || !is_file($fullPath) || is_link($fullPath)) {
+            $uploadError('Unable to save the uploaded file.');
+        }
     }
-    // Return the response
-    echo json_encode($response);
+
+    echo json_encode(array('status' => 'success', 'info' => 'file upload successful'));
     exit();
 }
 
@@ -1224,8 +1277,7 @@ if (isset($_POST['unzip'], $_POST['token']) && !FM_READONLY) {
         die("Invalid Token.");
     }
 
-    $unzip = urldecode($_POST['unzip']);
-    $unzip = fm_clean_path($unzip);
+    $unzip = fm_clean_path($_POST['unzip']);
     $unzip = str_replace('/', '', $unzip);
     $isValid = false;
 
@@ -1431,7 +1483,7 @@ if (isset($_GET['upload']) && !FM_READONLY) {
 
                 <form action="<?php echo htmlspecialchars(FM_SELF_URL) . '?p=' . fm_enc(FM_PATH) ?>" class="dropzone card-tabs-container" id="fileUploader" enctype="multipart/form-data">
                     <input type="hidden" name="p" value="<?php echo fm_enc(FM_PATH) ?>">
-                    <input type="hidden" name="fullpath" id="fullpath" value="<?php echo fm_enc(FM_PATH) ?>">
+                    <input type="hidden" name="fullpath" id="fullpath" value="">
                     <input type="hidden" name="token" value="<?php echo $_SESSION['token']; ?>">
                     <div class="fallback">
                         <input name="file" type="file" multiple />
@@ -1859,12 +1911,12 @@ if (isset($_GET['view'])) {
                 ?>
                     <form method="post" class="d-inline btn btn-outline-primary mb-0">
                         <input type="hidden" name="token" value="<?php echo $_SESSION['token']; ?>">
-                        <input type="hidden" name="unzip" value="<?php echo urlencode($file); ?>">
+                        <input type="hidden" name="unzip" value="<?php echo fm_enc($file); ?>">
                         <button type="submit" class="btn btn-link text-decoration-none fw-bold p-0 border-0" style="font-size: 14px;"><i class="fa fa-check-circle"></i> <?php echo lng('UnZip') ?></button>
                     </form>
                     <form method="post" class="d-inline btn btn-outline-primary mb-0">
                         <input type="hidden" name="token" value="<?php echo $_SESSION['token']; ?>">
-                        <input type="hidden" name="unzip" value="<?php echo urlencode($file); ?>">
+                        <input type="hidden" name="unzip" value="<?php echo fm_enc($file); ?>">
                         <input type="hidden" name="tofolder" value="1">
                         <button type="submit" class="btn btn-link text-decoration-none fw-bold p-0" style="font-size: 14px;" title="UnZip to <?php echo fm_enc($zip_name) ?>"><i class="fa fa-check-circle"></i> <?php echo lng('UnZipToFolder') ?></button>
                     </form>
@@ -1957,7 +2009,7 @@ if (isset($_GET['edit']) && !FM_READONLY) {
         $FM_PATH = FM_PATH;
         fm_redirect(FM_SELF_URL . '?p=' . urlencode($FM_PATH));
     }
-    $editFile = ' : <i><b>' . $file . '</b></i>';
+    $editFile = ' : <i><b>' . fm_enc($file) . '</b></i>';
     header('X-XSS-Protection:0');
     fm_show_header(); // HEADER
     fm_show_nav_path(FM_PATH); // current path
@@ -2218,10 +2270,10 @@ $all_files_size = 0;
                             </div>
                         </td>
                     <?php endif; ?>
-                    <td data-sort=<?php echo fm_convert_win(fm_enc($f)) ?>>
+                    <td data-sort="<?php echo fm_enc(fm_convert_win($f)) ?>">
                         <div class="filename">
                             <a href="?p=<?php echo urlencode(trim(FM_PATH . '/' . $f, '/')) ?>"><i class="<?php echo $img ?>"></i> <?php echo fm_convert_win(fm_enc($f)) ?></a>
-                            <?php echo ($is_link ? ' &rarr; <i>' . readlink($path . '/' . $f) . '</i>' : '') ?>
+                            <?php echo ($is_link ? ' &rarr; <i>' . fm_enc(readlink($path . '/' . $f)) . '</i>' : '') ?>
                         </div>
                     </td>
                     <td data-order="a-<?php echo str_pad($filesize_raw, 18, "0", STR_PAD_LEFT); ?>">
@@ -2289,18 +2341,18 @@ $all_files_size = 0;
                                 <label class="custom-control-label" for="<?php echo $ik ?>"></label>
                             </div>
                         </td><?php endif; ?>
-                    <td data-sort=<?php echo fm_enc($f) ?>>
+                    <td data-sort="<?php echo fm_enc($f) ?>">
                         <div class="filename">
                             <?php
                             if (in_array(strtolower(pathinfo($f, PATHINFO_EXTENSION)), array('gif', 'jpg', 'jpeg', 'png', 'bmp', 'ico', 'svg', 'webp', 'avif'))): ?>
                                 <?php $imagePreview = fm_enc(FM_ROOT_URL . (FM_PATH != '' ? '/' . FM_PATH : '') . '/' . $f); ?>
                                 <a href="<?php echo $filelink ?>" data-preview-image="<?php echo $imagePreview ?>" title="<?php echo fm_enc($f) ?>">
                                 <?php else: ?>
-                                    <a href="<?php echo $filelink ?>" title="<?php echo $f ?>">
+                                    <a href="<?php echo $filelink ?>" title="<?php echo fm_enc($f) ?>">
                                     <?php endif; ?>
                                     <i class="<?php echo $img ?>"></i> <?php echo fm_convert_win(fm_enc($f)) ?>
                                     </a>
-                                    <?php echo ($is_link ? ' &rarr; <i>' . readlink($path . '/' . $f) . '</i>' : '') ?>
+                                    <?php echo ($is_link ? ' &rarr; <i>' . fm_enc(readlink($path . '/' . $f)) . '</i>' : '') ?>
                         </div>
                     </td>
                     <td data-order="b-<?php echo str_pad($filesize_raw, 18, "0", STR_PAD_LEFT); ?>"><span title="<?php printf('%s bytes', $filesize_raw) ?>">
@@ -2758,6 +2810,14 @@ function fm_get_translations($tr)
  */
 function fm_get_size($file)
 {
+    // 64-bit PHP: filesize() is exact for any size, no need to spawn a process per file
+    if (PHP_INT_SIZE >= 8) {
+        $size = @filesize($file);
+        if ($size !== false) {
+            return $size;
+        }
+    }
+
     static $iswin = null;
     static $isdarwin = null;
     static $exec_works = null;
@@ -3283,6 +3343,7 @@ function fm_get_text_mimes()
         'image/svg+xml',
         'message/rfc822',
         'application/json',
+        'application/x-empty',
     );
 }
 
@@ -3724,20 +3785,483 @@ class FM_Config
     {
         global $config_file;
         $fm_file = is_readable($config_file) ? $config_file : __FILE__;
-        $var_name = '$CONFIG';
-        $var_value = var_export(json_encode($this->data), true);
-        $config_string = "<?php" . chr(13) . chr(10) . "//Default Configuration" . chr(13) . chr(10) . "$var_name = $var_value;" . chr(13) . chr(10);
-        if (is_writable($fm_file)) {
-            $lines = file($fm_file);
-            if ($fh = @fopen($fm_file, "w")) {
-                @fputs($fh, $config_string, strlen($config_string));
-                for ($x = 3; $x < count($lines); $x++) {
-                    @fputs($fh, $lines[$x], strlen($lines[$x]));
+        if (!is_file($fm_file) || is_link($fm_file) || !is_writable($fm_file)) {
+            return false;
+        }
+
+        $original = @file_get_contents($fm_file);
+        $json = json_encode($this->data);
+        if ($original === false || $json === false) {
+            return false;
+        }
+        $replacement = var_export($json, true);
+        $tokens = token_get_all($original);
+        $offsets = array();
+        $offset = 0;
+        foreach ($tokens as $index => $token) {
+            $offsets[$index] = $offset;
+            $offset += strlen(is_array($token) ? $token[1] : $token);
+        }
+
+        $openTagEnd = null;
+        $assignmentCount = 0;
+        $valueStart = null;
+        $valueLength = 0;
+        $depth = 0;
+        $canInsert = true;
+        foreach ($tokens as $index => $token) {
+            $id = is_array($token) ? $token[0] : null;
+            $text = is_array($token) ? $token[1] : $token;
+            if ($id === T_DECLARE || $id === T_NAMESPACE) {
+                $canInsert = false;
+            }
+            if ($id === T_OPEN_TAG && $openTagEnd === null) {
+                $openTagEnd = $offsets[$index] + strlen($text);
+            }
+            if ($id === T_VARIABLE && $text === '$CONFIG') {
+                $next = $index + 1;
+                while (isset($tokens[$next]) && is_array($tokens[$next]) && in_array($tokens[$next][0], array(T_WHITESPACE, T_COMMENT, T_DOC_COMMENT), true)) {
+                    $next++;
                 }
-                @fclose($fh);
+                $nextToken = isset($tokens[$next]) ? $tokens[$next] : null;
+                $operatorId = is_array($nextToken) ? $nextToken[0] : null;
+                $operatorText = is_array($nextToken) ? $nextToken[1] : $nextToken;
+                $operatorName = $operatorId === null ? '' : token_name($operatorId);
+                $isAssignment = $operatorText === '=' || in_array($operatorName, array(
+                    'T_AND_EQUAL', 'T_CONCAT_EQUAL', 'T_COALESCE_EQUAL', 'T_DIV_EQUAL',
+                    'T_MINUS_EQUAL', 'T_MOD_EQUAL', 'T_MUL_EQUAL', 'T_OR_EQUAL',
+                    'T_PLUS_EQUAL', 'T_POW_EQUAL', 'T_SL_EQUAL', 'T_SR_EQUAL',
+                    'T_XOR_EQUAL', 'T_INC', 'T_DEC'
+                ), true);
+                if ($isAssignment) {
+                    if ($depth !== 0 || $operatorText !== '=' || ++$assignmentCount !== 1) {
+                        return false;
+                    }
+                    $previous = $index - 1;
+                    while ($previous >= 0 && is_array($tokens[$previous]) && in_array($tokens[$previous][0], array(T_WHITESPACE, T_COMMENT, T_DOC_COMMENT), true)) {
+                        $previous--;
+                    }
+                    $previousToken = $previous >= 0 ? $tokens[$previous] : null;
+                    $previousId = is_array($previousToken) ? $previousToken[0] : null;
+                    $previousText = is_array($previousToken) ? $previousToken[1] : $previousToken;
+                    if ($previousId !== T_OPEN_TAG && !in_array($previousText, array(';', '}'), true)) {
+                        return false;
+                    }
+                    $valueIndex = $next + 1;
+                    while (isset($tokens[$valueIndex]) && is_array($tokens[$valueIndex]) && in_array($tokens[$valueIndex][0], array(T_WHITESPACE, T_COMMENT, T_DOC_COMMENT), true)) {
+                        $valueIndex++;
+                    }
+                    if (!isset($tokens[$valueIndex]) || !is_array($tokens[$valueIndex]) || $tokens[$valueIndex][0] !== T_CONSTANT_ENCAPSED_STRING) {
+                        return false;
+                    }
+                    $afterValue = $valueIndex + 1;
+                    while (isset($tokens[$afterValue]) && is_array($tokens[$afterValue]) && in_array($tokens[$afterValue][0], array(T_WHITESPACE, T_COMMENT, T_DOC_COMMENT), true)) {
+                        $afterValue++;
+                    }
+                    if (!isset($tokens[$afterValue]) || $tokens[$afterValue] !== ';') {
+                        return false;
+                    }
+                    $valueStart = $offsets[$valueIndex];
+                    $valueLength = strlen($tokens[$valueIndex][1]);
+                }
+            }
+            if (($id === null && $text === '{') || $id === T_CURLY_OPEN || $id === T_DOLLAR_OPEN_CURLY_BRACES) {
+                $depth++;
+            } elseif ($id === null && $text === '}') {
+                $depth--;
+                if ($depth < 0) {
+                    return false;
+                }
             }
         }
+
+        if ($openTagEnd === null || $assignmentCount > 1 || $depth !== 0) {
+            return false;
+        }
+        if ($assignmentCount === 1) {
+            $updated = substr($original, 0, $valueStart) . $replacement . substr($original, $valueStart + $valueLength);
+        } else {
+            if (!$canInsert) {
+                return false;
+            }
+            $newline = strpos($original, "\r\n") !== false ? "\r\n" : "\n";
+            $insert = $newline . '$CONFIG = ' . $replacement . ';' . $newline;
+            $updated = substr($original, 0, $openTagEnd) . $insert . substr($original, $openTagEnd);
+        }
+
+        if (!defined('TOKEN_PARSE')) {
+            return false;
+        }
+        try {
+            token_get_all($updated, TOKEN_PARSE);
+        } catch (ParseError $error) {
+            return false;
+        }
+
+        $directory = realpath(dirname($fm_file));
+        $mode = @fileperms($fm_file);
+        if ($directory === false || $mode === false) {
+            return false;
+        }
+        $mode &= 07777;
+        $temporary = @tempnam($directory, '.' . basename($fm_file) . '.tmp-');
+        if ($temporary === false) {
+            return false;
+        }
+        if (realpath(dirname($temporary)) !== $directory) {
+            @unlink($temporary);
+            return false;
+        }
+        $handle = @fopen($temporary, 'wb');
+        if ($handle === false) {
+            @unlink($temporary);
+            return false;
+        }
+        $written = 0;
+        $length = strlen($updated);
+        while ($written < $length) {
+            $count = @fwrite($handle, substr($updated, $written));
+            if ($count === false || $count === 0) {
+                @fclose($handle);
+                @unlink($temporary);
+                return false;
+            }
+            $written += $count;
+        }
+        $flushed = @fflush($handle);
+        $closed = @fclose($handle);
+        if (!$flushed || !$closed || !@chmod($temporary, $mode)) {
+            @unlink($temporary);
+            return false;
+        }
+        $current = @file_get_contents($fm_file);
+        if ($current === false || hash('sha256', $current) !== hash('sha256', $original) || !@rename($temporary, $fm_file)) {
+            @unlink($temporary);
+            return false;
+        }
+        if (function_exists('opcache_invalidate')) {
+            @opcache_invalidate($fm_file, true);
+        }
+        return true;
     }
+}
+
+
+function fm_is_public_ip($ip)
+{
+    if (!is_string($ip) || ($packed = @inet_pton($ip)) === false) {
+        return false;
+    }
+    $inCidr = function ($address, $cidr) {
+        list($network, $prefix) = explode('/', $cidr, 2);
+        $packedNetwork = @inet_pton($network);
+        if ($packedNetwork === false || strlen($packedNetwork) !== strlen($address)) {
+            return false;
+        }
+        $prefix = (int) $prefix;
+        $wholeBytes = (int) ($prefix / 8);
+        $remainingBits = $prefix % 8;
+        if (substr($address, 0, $wholeBytes) !== substr($packedNetwork, 0, $wholeBytes)) {
+            return false;
+        }
+        if ($remainingBits === 0) {
+            return true;
+        }
+        $mask = (0xff << (8 - $remainingBits)) & 0xff;
+        return (ord($address[$wholeBytes]) & $mask) === (ord($packedNetwork[$wholeBytes]) & $mask);
+    };
+
+    if (strlen($packed) === 4) {
+        if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4 | FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) === false) {
+            return false;
+        }
+        $blocked = array(
+            '0.0.0.0/8', '10.0.0.0/8', '100.64.0.0/10', '127.0.0.0/8',
+            '169.254.0.0/16', '172.16.0.0/12', '192.0.0.0/24', '192.0.2.0/24',
+            '192.31.196.0/24', '192.52.193.0/24', '192.88.99.0/24',
+            '192.168.0.0/16', '192.175.48.0/24', '168.63.129.16/32',
+            '198.18.0.0/15', '198.51.100.0/24', '203.0.113.0/24',
+            '224.0.0.0/4', '240.0.0.0/4'
+        );
+    } elseif (strlen($packed) === 16) {
+        if (!$inCidr($packed, '2000::/3')) {
+            return false;
+        }
+        $blocked = array(
+            '2001::/23', '2001:db8::/32', '2002::/16', '3fff::/20', '5f00::/16'
+        );
+    } else {
+        return false;
+    }
+
+    foreach ($blocked as $cidr) {
+        if ($inCidr($packed, $cidr)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function fm_resolve_public_url_host($host)
+{
+    if (!is_string($host) || $host === '' || preg_match('/[\x00-\x20\x7f]/', $host)) {
+        return false;
+    }
+    if (strlen($host) > 2 && $host[0] === '[' && substr($host, -1) === ']') {
+        $host = substr($host, 1, -1);
+    } elseif (strpos($host, '[') !== false || strpos($host, ']') !== false) {
+        return false;
+    }
+    $packed = @inet_pton($host);
+    if ($packed !== false) {
+        return fm_is_public_ip($host) ? inet_ntop($packed) : false;
+    }
+    if (strpos($host, ':') !== false || preg_match('/^(?:[0-9]+|0x[0-9a-f]+)(?:\.(?:[0-9]+|0x[0-9a-f]+))*$/i', $host)) {
+        return false;
+    }
+    $domain = strtolower(rtrim($host, '.'));
+    if ($domain === '' || strlen($domain) > 253) {
+        return false;
+    }
+    foreach (explode('.', $domain) as $label) {
+        if (strlen($label) > 63 || !preg_match('/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/i', $label)) {
+            return false;
+        }
+    }
+    $records = @dns_get_record($domain, DNS_A | DNS_AAAA);
+    if (!is_array($records) || !$records) {
+        return false;
+    }
+    $addresses = array();
+    foreach ($records as $record) {
+        if (isset($record['ip'])) {
+            $addresses[] = $record['ip'];
+        } elseif (isset($record['ipv6'])) {
+            $addresses[] = $record['ipv6'];
+        }
+    }
+    if (!$addresses) {
+        return false;
+    }
+    foreach ($addresses as $address) {
+        if (!fm_is_public_ip($address)) {
+            return false;
+        }
+    }
+    return $addresses[0];
+}
+
+function fm_validate_remote_url($url, &$details, &$error)
+{
+    $details = null;
+    $error = 'Invalid URL.';
+    if (!is_string($url) || $url === '' || strlen($url) > 4096 || preg_match('/[\x00-\x20\x7f\\\\]/', $url)) {
+        return false;
+    }
+    $parts = @parse_url($url);
+    if (!is_array($parts) || !isset($parts['scheme'], $parts['host']) || isset($parts['user']) || isset($parts['pass'])) {
+        return false;
+    }
+    $scheme = strtolower($parts['scheme']);
+    if ($scheme !== 'http' && $scheme !== 'https') {
+        $error = 'Only HTTP and HTTPS URLs are allowed.';
+        return false;
+    }
+    $defaultPort = $scheme === 'https' ? 443 : 80;
+    $port = isset($parts['port']) ? (int) $parts['port'] : $defaultPort;
+    if ($port !== $defaultPort) {
+        $error = 'Only the default HTTP and HTTPS ports (80 and 443) are allowed.';
+        return false;
+    }
+    $host = $parts['host'];
+    $hostForIp = strlen($host) > 2 && $host[0] === '[' && substr($host, -1) === ']' ? substr($host, 1, -1) : $host;
+    $isLiteral = @inet_pton($hostForIp) !== false;
+    if (!$isLiteral && substr($host, -1) === '.') {
+        $error = 'Trailing-dot hostnames are not supported.';
+        return false;
+    }
+    $address = fm_resolve_public_url_host($host);
+    if ($address === false) {
+        $error = 'URL host does not resolve exclusively to public addresses.';
+        return false;
+    }
+    $details = array(
+        'scheme' => $scheme,
+        'host' => $host,
+        'port' => $port,
+        'address' => $address,
+        'literal' => $isLiteral
+    );
+    $error = '';
+    return true;
+}
+
+function fm_url_upload_filename($url, $allowedExtensions = false)
+{
+    if (!is_string($url) || $url === '' || strlen($url) > 4096 || ($allowedExtensions !== false && !is_string($allowedExtensions))) {
+        return false;
+    }
+    $parts = @parse_url($url);
+    if (!is_array($parts) || empty($parts['path']) || substr($parts['path'], -1) === '/') {
+        return false;
+    }
+    $path = $parts['path'];
+    $separator = strrpos($path, '/');
+    $encodedName = $separator === false ? $path : substr($path, $separator + 1);
+    $filename = rawurldecode($encodedName);
+    if ($filename === '' || strlen($filename) > 255 || $filename === '.' || $filename === '..' || strpbrk($filename, "/\\") !== false || preg_match('/[\x00-\x1f\x7f]/', $filename) || !fm_isvalid_filename($filename)) {
+        return false;
+    }
+    if ($allowedExtensions) {
+        $allowed = array_map('strtolower', array_map('trim', explode(',', $allowedExtensions)));
+        if (!in_array(strtolower(pathinfo($filename, PATHINFO_EXTENSION)), $allowed, true)) {
+            return false;
+        }
+    }
+    return $filename;
+}
+
+function fm_upload_path_is_safe($root, $directory, $target = null)
+{
+    $rootReal = realpath($root);
+    if ($rootReal === false) {
+        return false;
+    }
+    $candidate = $directory;
+    while (!file_exists($candidate)) {
+        if (is_link($candidate)) {
+            return false;
+        }
+        $parent = dirname($candidate);
+        if ($parent === $candidate) {
+            return false;
+        }
+        $candidate = $parent;
+    }
+    $resolved = realpath($candidate);
+    if ($resolved === false || !is_dir($resolved)) {
+        return false;
+    }
+    $prefix = rtrim($rootReal, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
+    if ($resolved !== $rootReal && strpos($resolved, $prefix) !== 0) {
+        return false;
+    }
+    return $target === null || !is_link($target);
+}
+
+function fm_fetch_url_to_file($url, $tempFile, $maxBytes, &$error, &$downloadInfo = null)
+{
+    $error = '';
+    $downloadInfo = array();
+    if (!function_exists('curl_init')) {
+        $error = 'URL uploads require the PHP cURL extension.';
+        return false;
+    }
+    $details = null;
+    if (!fm_validate_remote_url($url, $details, $error) || !is_file($tempFile) || is_link($tempFile)) {
+        if ($error === '') {
+            $error = 'Unable to create a safe temporary file.';
+        }
+        return false;
+    }
+    $maxBytes = (int) $maxBytes;
+    if ($maxBytes < 0) {
+        $error = 'Invalid download size limit.';
+        return false;
+    }
+    $handle = @fopen($tempFile, 'wb');
+    if ($handle === false) {
+        $error = 'Unable to open the temporary download file.';
+        return false;
+    }
+    $ch = curl_init($url);
+    if ($ch === false) {
+        @fclose($handle);
+        $error = 'Unable to initialize cURL.';
+        @unlink($tempFile);
+        return false;
+    }
+
+    $downloaded = 0;
+    $tooLarge = false;
+    $writeFunction = function ($curl, $data) use ($handle, &$downloaded, &$tooLarge, $maxBytes) {
+        $length = strlen($data);
+        if ($length > $maxBytes - $downloaded) {
+            $tooLarge = true;
+            return 0;
+        }
+        $offset = 0;
+        while ($offset < $length) {
+            $written = @fwrite($handle, substr($data, $offset));
+            if ($written === false || $written === 0) {
+                return 0;
+            }
+            $offset += $written;
+        }
+        $downloaded += $length;
+        return $length;
+    };
+    $options = array(
+        CURLOPT_RETURNTRANSFER => false,
+        CURLOPT_FOLLOWLOCATION => false,
+        CURLOPT_MAXREDIRS => 0,
+        CURLOPT_PROXY => '',
+        CURLOPT_NOPROXY => '*',
+        CURLOPT_CONNECTTIMEOUT => 10,
+        CURLOPT_TIMEOUT => 60,
+        CURLOPT_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
+        CURLOPT_REDIR_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_SSL_VERIFYHOST => 2,
+        CURLOPT_WRITEFUNCTION => $writeFunction
+    );
+    if (!$details['literal']) {
+        if (!defined('CURLOPT_RESOLVE')) {
+            if (PHP_VERSION_ID < 80000) {
+                curl_close($ch);
+            }
+            @fclose($handle);
+            @unlink($tempFile);
+            $error = 'The installed cURL version cannot pin DNS results safely.';
+            return false;
+        }
+        $resolvedAddress = strpos($details['address'], ':') !== false ? '[' . $details['address'] . ']' : $details['address'];
+        $options[CURLOPT_RESOLVE] = array($details['host'] . ':' . $details['port'] . ':' . $resolvedAddress);
+    }
+    if (!curl_setopt_array($ch, $options)) {
+        if (PHP_VERSION_ID < 80000) {
+            curl_close($ch);
+        }
+        @fclose($handle);
+        @unlink($tempFile);
+        $error = 'Unable to configure cURL safely.';
+        return false;
+    }
+    $executed = curl_exec($ch);
+    $responseCode = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    $contentType = curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
+    $curlError = curl_error($ch);
+    if (PHP_VERSION_ID < 80000) {
+        curl_close($ch);
+    }
+    $flushed = @fflush($handle);
+    $closed = @fclose($handle);
+    if ($tooLarge) {
+        $error = 'The remote file exceeds the download size limit.';
+    } elseif (!$executed) {
+        $error = $curlError !== '' ? $curlError : 'The remote download failed.';
+    } elseif ($responseCode >= 300 && $responseCode < 400) {
+        $error = 'Redirect responses are not allowed.';
+    } elseif ($responseCode < 200 || $responseCode >= 300) {
+        $error = 'Remote server returned HTTP status ' . $responseCode . '.';
+    } elseif (!$flushed || !$closed) {
+        $error = 'Unable to write the remote file completely.';
+    } else {
+        $downloadInfo = array('size' => $downloaded, 'type' => $contentType);
+        return true;
+    }
+    @unlink($tempFile);
+    return false;
 }
 
 //--- Templates Functions ---
@@ -3786,8 +4310,8 @@ function fm_show_nav_path($path)
                                 <span class="input-group-text brl-0 brr-0" id="search-addon2"><i class="fa fa-search"></i></span>
                             </div>
                             <div class="input-group-append btn-group">
-                                <span class="input-group-text dropdown-toggle brl-0" data-bs-toggle="dropdown" aria-haspopup="true" aria-expanded="false"></span>
-                                <div class="dropdown-menu dropdown-menu-right">
+                                <button type="button" class="input-group-text dropdown-toggle brl-0" aria-label="<?php echo fm_enc(lng('Advanced Search')) ?>" data-bs-toggle="dropdown" aria-haspopup="true" aria-expanded="false"></button>
+                                <div class="dropdown-menu dropdown-menu-end">
                                     <a class="dropdown-item" href="<?php echo $path2 = $path ? $path : '.'; ?>" id="js-search-modal" data-bs-toggle="modal" data-bs-target="#searchModal"><?php echo lng('Advanced Search') ?></a>
                                 </div>
                             </div>
@@ -4030,7 +4554,7 @@ function fm_show_header_login()
         <?php if ($favicon_path) {
             echo '<link rel="icon" href="' . fm_enc($favicon_path) . '" type="image/png">';
         } ?>
-        <title><?php echo fm_enc(APP_TITLE) ?> | <?php echo (isset($_GET['view']) ? $_GET['view'] : ((isset($_GET['edit'])) ? $_GET['edit'] : "H3K")); ?></title>
+        <title><?php echo fm_enc(APP_TITLE) ?> | <?php echo fm_enc(isset($_GET['view']) ? $_GET['view'] : (isset($_GET['edit']) ? $_GET['edit'] : "H3K")); ?></title>
         <?php print_external('pre-jsdelivr'); ?>
         <?php print_external('pre-cloudflare'); ?>
         <?php print_external('css-bootstrap'); ?>
@@ -4950,16 +5474,31 @@ function fm_show_header_login()
                             url: window.location,
                             data: JSON.stringify(data),
                             contentType: "application/json; charset=utf-8",
-                            success: function(mes) {
-                                toast("<?php echo lng("Saved Successfully"); ?>");
-                                window.onbeforeunload = function() {
-                                    return
+                            success: function(mes, textStatus, xhr) {
+                                var saveConfirmed = xhr.getResponseHeader("X-TFM-Save-Success") === "1" || String(mes).trim() === "1";
+                                if (saveConfirmed) {
+                                    toast("<?php echo lng("Saved Successfully"); ?>");
+                                    window.onbeforeunload = function() {
+                                        return
+                                    }
+                                } else {
+                                    alert("The file was not saved. The server returned an unexpected response:\n\n" + String(mes).trim().substring(0, 500));
                                 }
                             },
                             failure: function(mes) {
                                 toast("<?php echo lng("Error: try again"); ?>");
                             },
                             error: function(mes) {
+                                var refreshedToken = mes.getResponseHeader("X-CSRF-Token");
+                                if (mes.status === 409 && refreshedToken) {
+                                    window.csrf = refreshedToken;
+                                    alert("Your session was renewed. The file was not saved. The security token has been refreshed. Click Save again to confirm.");
+                                    return;
+                                }
+                                if (mes.status === 401) {
+                                    alert("Session expired. The file was not saved. Log in again in another tab, then click Save again.");
+                                    return;
+                                }
                                 toast(`<p style="background-color:red">${mes.responseText}</p>`);
                             }
                         });
@@ -4993,11 +5532,13 @@ function fm_show_header_login()
                         if (data) {
                             window.location.reload();
                         }
+                    },
+                    error: function(xhr) {
+                        alert(xhr.responseText || 'Settings were not saved.');
                     }
                 });
                 return false;
             }
-
             //Create new password hash
             function new_password_hash($this) {
                 let form = $($this),
@@ -5031,12 +5572,12 @@ function fm_show_header_login()
                     },
                     success: function(data) {
                         if (data) {
-                            data = JSON.parse(data);
+                            data = typeof data === 'string' ? JSON.parse(data) : data;
                             if (data.done) {
-                                resultWrapper.append('<div class="alert alert-success row"><?php echo lng("Uploaded Successful"); ?>: ' + data.done.name + '</div>');
+                                resultWrapper.append($('<div>').addClass('alert alert-success row').text(<?php echo json_encode(lng("Uploaded Successful")); ?> + ': ' + data.done.name));
                                 form.find("input[name=uploadurl]").val('');
                             } else if (data['fail']) {
-                                resultWrapper.append('<div class="alert alert-danger row"><?php echo lng("Error"); ?>: ' + data.fail.message + '</div>');
+                                resultWrapper.append($('<div>').addClass('alert alert-danger row').text(<?php echo json_encode(lng("Error")); ?> + ': ' + data.fail.message));
                             }
                             form.find("input[name=uploadurl]").removeAttr("disabled");
                             form.find("button").show();
