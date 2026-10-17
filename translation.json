@@ -1192,6 +1192,8 @@
         "CopyTo": "複製到",
         "DirectLink": "直接連結",
         "UploadingFiles": "上傳檔案",
+        "Overwrite existing files": "覆蓋同名檔案",
+        "When checked, existing files are replaced after upload completes. Changes apply to newly added files.": "勾選後，完整上傳成功才會覆蓋同名檔案。變更選項只影響之後加入的檔案。",
         "ChangePermissions": "變更權限",
         "Copying": "複製",
         "CreateNewItem": "建立新檔案",

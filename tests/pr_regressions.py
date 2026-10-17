@@ -114,10 +114,12 @@ class PRRegressions(unittest.TestCase):
         with response:
             return response.status, response.headers, response.read().decode()
 
-    def upload(self, token, filename, fullpath=None, content=b"uploaded", chunk=None, upload_id=None):
+    def upload(self, token, filename, fullpath=None, content=b"uploaded", chunk=None, upload_id=None, overwrite=None):
         boundary = "tinyfm-" + secrets.token_hex(12)
         fields = {"token": token, "fullpath": fullpath if fullpath is not None else filename,
                   "dzchunkindex": "0", "dztotalchunkcount": "0"}
+        if overwrite is not None:
+            fields["overwrite"] = overwrite
         if chunk is not None:
             fields.update(dzchunkindex=str(chunk[0]), dztotalchunkcount=str(chunk[1]))
             fields["dzuuid"] = upload_id or hashlib.sha256(
@@ -367,6 +369,163 @@ class PRRegressions(unittest.TestCase):
         _, _, body = self.upload(token, "chunk.txt", chunk=(0, 2))
         self.assertEqual(json.loads(body)["status"], "error")
         self.assertFalse((outside / "chunk").exists())
+
+    def test_upload_overwrite_ui_is_checked_and_snapshots_each_file(self):
+        self.login()
+        status, _, body = self.request("?p=&upload=1")
+        self.assertEqual(status, 200)
+        self.assertRegex(body, r'id="upload-overwrite"[^>]*\bchecked\b')
+        self.assertIn('for="upload-overwrite"', body)
+        self.assertIn('aria-describedby="upload-overwrite-help"', body)
+        self.assertIn('this.on("addedfile", function(file)', body)
+        self.assertIn('formData.append("overwrite", file.overwriteExisting)', body)
+
+    def test_chunk_overwrite_waits_for_completion_and_preserves_permissions(self):
+        token, _ = self.login()
+        target = self.root / "data" / "overwrite-chunk.txt"
+        target.write_bytes(b"original")
+        target.chmod(0o600)
+        inode = target.stat().st_ino
+        _, _, body = self.upload(
+            token, target.name, content=b"first-", chunk=(0, 2),
+            upload_id="overwrite-chunk", overwrite="1")
+        self.assertEqual(json.loads(body)["status"], "success")
+        self.assertEqual(target.read_bytes(), b"original")
+        self.assertEqual(target.stat().st_ino, inode)
+        _, _, body = self.upload(
+            token, target.name, content=b"wrong", chunk=(1, 2),
+            upload_id="overwrite-chunk", overwrite="0")
+        self.assertEqual(json.loads(body)["status"], "error")
+        self.assertEqual(target.read_bytes(), b"original")
+        _, _, body = self.upload(
+            token, target.name, content=b"second", chunk=(1, 2),
+            upload_id="overwrite-chunk", overwrite="1")
+        self.assertEqual(json.loads(body)["status"], "success")
+        self.assertEqual(target.read_bytes(), b"first-second")
+        self.assertNotEqual(target.stat().st_ino, inode)
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+        self.assertFalse((target.parent / (target.name + ".part")).exists())
+        self.assertEqual(list(target.parent.glob("overwrite-chunk_*.txt")), [])
+
+    def test_multipart_overwrite_choice_and_legacy_default(self):
+        token, _ = self.login()
+        for choice, basename in (("1", "overwrite-single"), ("0", "rename-single"),
+                                 (None, "legacy-single")):
+            with self.subTest(choice=choice):
+                target = self.root / "data" / (basename + ".txt")
+                target.write_bytes(b"original")
+                target.chmod(0o600)
+                inode = target.stat().st_ino
+                _, _, body = self.upload(
+                    token, target.name, content=b"replacement", overwrite=choice)
+                self.assertEqual(json.loads(body)["status"], "success")
+                if choice == "0":
+                    self.assertEqual(target.read_bytes(), b"original")
+                    renamed = list(target.parent.glob(basename + "_*.txt"))
+                    self.assertEqual(len(renamed), 1)
+                    self.assertEqual(renamed[0].read_bytes(), b"replacement")
+                else:
+                    self.assertEqual(target.read_bytes(), b"replacement")
+                    self.assertNotEqual(target.stat().st_ino, inode)
+                    self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+                    self.assertEqual(list(target.parent.glob(basename + "_*.txt")), [])
+
+    def test_new_multipart_file_permissions_match_chunked_uploads(self):
+        token, _ = self.login()
+        modes = []
+        for name, chunk in (("permission-single.txt", None),
+                            ("permission-chunk.txt", (0, 1))):
+            _, _, body = self.upload(token, name, chunk=chunk, overwrite="1")
+            self.assertEqual(json.loads(body)["status"], "success")
+            modes.append((self.root / "data" / name).stat().st_mode & 0o777)
+        self.assertEqual(modes[0], modes[1])
+
+    def test_chunk_overwrite_unchecked_keeps_original(self):
+        token, _ = self.login()
+        target = self.root / "data" / "unchecked-chunk.txt"
+        target.write_bytes(b"original")
+        _, _, body = self.upload(
+            token, target.name, content=b"new", chunk=(0, 1), overwrite="0")
+        self.assertEqual(json.loads(body)["status"], "success")
+        self.assertEqual(target.read_bytes(), b"original")
+        renamed = list(target.parent.glob("unchecked-chunk_*.txt"))
+        self.assertEqual(len(renamed), 1)
+        self.assertEqual(renamed[0].read_bytes(), b"new")
+
+    def test_failed_overwrite_preserves_original(self):
+        config = self.root / "config.php"
+        original = config.read_text()
+        try:
+            config.write_text(original + "$max_upload_size_bytes = 5;\n")
+            token, _ = self.login()
+            target = self.root / "data" / "failed-overwrite.txt"
+            target.write_bytes(b"original")
+            for index, content in enumerate((b"abc", b"def")):
+                _, _, body = self.upload(
+                    token, target.name, content=content, chunk=(index, 2),
+                    upload_id="failed-overwrite", overwrite="1")
+                self.assertEqual(json.loads(body)["status"],
+                                 "success" if index == 0 else "error")
+                self.assertEqual(target.read_bytes(), b"original")
+            self.assertFalse((target.parent / (target.name + ".part")).exists())
+            _, _, body = self.upload(
+                token, target.name, content=b"abcdef", overwrite="1")
+            self.assertEqual(json.loads(body)["status"], "error")
+            self.assertEqual(target.read_bytes(), b"original")
+        finally:
+            config.write_text(original)
+
+    def test_overwrite_rejects_invalid_token_and_option(self):
+        token, _ = self.login()
+        target = self.root / "data" / "guarded-overwrite.txt"
+        target.write_bytes(b"original")
+        for posted_token, choice in (("invalid-token", "1"), (token, "true")):
+            _, _, body = self.upload(
+                posted_token, target.name, content=b"must not write",
+                chunk=(0, 1), overwrite=choice)
+            self.assertEqual(json.loads(body)["status"], "error")
+            self.assertEqual(target.read_bytes(), b"original")
+        _, _, body = self.upload(
+            token, "invalid.txt", "invalid-option-folder/invalid.txt", overwrite="yes")
+        self.assertEqual(json.loads(body)["status"], "error")
+        self.assertFalse((self.root / "data" / "invalid-option-folder").exists())
+
+    def test_overwrite_does_not_bypass_authentication_or_readonly(self):
+        config = self.root / "config.php"
+        original = config.read_text()
+        target = self.root / "data" / "readonly-overwrite.txt"
+        target.write_bytes(b"original")
+        try:
+            config.write_text(original + "$readonly_users = array('qa');\n")
+            token, _ = self.login()
+            for chunk in (None, (0, 1)):
+                _, _, body = self.upload(token, target.name, chunk=chunk, overwrite="1")
+                self.assertNotIn('"status":"success"', body.replace(" ", ""))
+                self.assertEqual(target.read_bytes(), b"original")
+            self.request("?logout=1")
+            _, _, body = self.upload(token, target.name, chunk=(0, 1), overwrite="1")
+            self.assertNotIn('"status":"success"', body.replace(" ", ""))
+            self.assertEqual(target.read_bytes(), b"original")
+        finally:
+            config.write_text(original)
+
+    def test_overwrite_rejects_symlinks_and_directories(self):
+        token, _ = self.login()
+        outside = self.root / "overwrite-outside.txt"
+        outside.write_bytes(b"outside")
+        link = self.root / "data" / "overwrite-link.txt"
+        link.symlink_to(outside)
+        directory = self.root / "data" / "overwrite-directory"
+        directory.mkdir()
+        (directory / "kept.txt").write_bytes(b"keep")
+        for chunk in (None, (0, 1)):
+            for name in (link.name, directory.name):
+                _, _, body = self.upload(token, name, chunk=chunk, overwrite="1")
+                self.assertEqual(json.loads(body)["status"], "error")
+                self.assertTrue(link.is_symlink())
+                self.assertEqual(outside.read_bytes(), b"outside")
+                self.assertEqual((directory / "kept.txt").read_bytes(), b"keep")
+        self.assertEqual(list((self.root / "data").glob(".upload-*")), [])
 
     def test_chunk_upload_assembles_in_original_folder(self):
         token, _ = self.login()

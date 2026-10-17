@@ -1037,6 +1037,11 @@ if (!empty($_FILES) && !FM_READONLY) {
     if ($chunkTotal > 0 && (!is_string($uploadId) || !preg_match('/^[a-zA-Z0-9_-]{1,128}$/', $uploadId))) {
         $uploadError('Invalid upload identity.');
     }
+    if (isset($_POST['overwrite']) && !in_array($_POST['overwrite'], array('0', '1'), true)) {
+        $uploadError('Invalid overwrite option.');
+    }
+    // Keep legacy API defaults; the upload UI sends an explicit choice for every file.
+    $overwrite = isset($_POST['overwrite']) ? $_POST['overwrite'] === '1' : $chunkTotal === 0;
 
     $basePath = FM_ROOT_PATH;
     if (FM_PATH != '') {
@@ -1076,8 +1081,8 @@ if (!empty($_FILES) && !FM_READONLY) {
             if ($state !== null) {
                 $uploadError('Another upload is already in progress for this file.');
             }
-            $state = array('id' => $uploadId, 'next' => 0, 'total' => $chunkTotal, 'bytes' => 0);
-        } elseif (!is_array($state) || $state['id'] !== $uploadId || $state['next'] !== $chunkIndex || $state['total'] !== $chunkTotal) {
+            $state = array('id' => $uploadId, 'next' => 0, 'total' => $chunkTotal, 'bytes' => 0, 'overwrite' => $overwrite);
+        } elseif (!is_array($state) || $state['id'] !== $uploadId || $state['next'] !== $chunkIndex || $state['total'] !== $chunkTotal || (isset($state['overwrite']) ? $state['overwrite'] : false) !== $overwrite) {
             $uploadError('Upload chunks are missing, out of order, or belong to another upload.');
         }
         $incomingSize = @filesize($tmpName);
@@ -1143,23 +1148,53 @@ if (!empty($_FILES) && !FM_READONLY) {
         $_SESSION[FM_SESSION_ID]['uploads'][$chunkKey]['next'] = $chunkIndex + 1;
         $_SESSION[FM_SESSION_ID]['uploads'][$chunkKey]['bytes'] = $totalBytes;
 
-        if ($chunkIndex === $chunkTotal - 1) {
+    } else {
+        $incomingSize = @filesize($tmpName);
+        if ($incomingSize === false || $incomingSize > MAX_UPLOAD_SIZE) {
+            $uploadError('The upload exceeds the configured size limit.');
+        }
+        // Exclusive creation retains normal permissions even when the upload is copied across filesystems.
+        $stagingNonce = function_exists('random_bytes') ? random_bytes(16) : openssl_random_pseudo_bytes(16);
+        if ($stagingNonce === false) {
+            $uploadError('Unable to generate a staging filename.');
+        }
+        $partPath = $folder . '/.upload-' . bin2hex($stagingNonce);
+        $staged = @fopen($partPath, 'xb');
+        if ($staged === false) {
+            $uploadError('Unable to create a staging file.');
+        }
+        if (!@fclose($staged) || !@move_uploaded_file($tmpName, $partPath)) {
+            @unlink($partPath);
+            $uploadError('Unable to stage the uploaded file.');
+        }
+    }
+
+    if ($chunkTotal === 0 || $chunkIndex === $chunkTotal - 1) {
+        if ($chunkTotal > 0) {
             unset($_SESSION[FM_SESSION_ID]['uploads'][$chunkKey]);
-            $target = $fullPath;
-            if (file_exists($fullPath)) {
-                $singleDotfile = $filename[0] === '.' && strpos($filename, '.', 1) === false;
-                $extensionWithDot = !$singleDotfile && $extension !== '' ? substr($filename, -strlen($extension) - 1) : '';
-                $baseName = $extensionWithDot !== '' ? substr($filename, 0, -strlen($extensionWithDot)) : $filename;
-                $target = $folder . '/' . $baseName . '_' . date('ymdHis') . $extensionWithDot;
-            }
-            if (is_link($target) || file_exists($target) || !fm_upload_path_is_safe(FM_ROOT_PATH, $folder, $target) || !@rename($partPath, $target)) {
+        }
+        $target = $fullPath;
+        if (file_exists($fullPath) && !$overwrite) {
+            $singleDotfile = $filename[0] === '.' && strpos($filename, '.', 1) === false;
+            $extensionWithDot = !$singleDotfile && $extension !== '' ? substr($filename, -strlen($extension) - 1) : '';
+            $baseName = $extensionWithDot !== '' ? substr($filename, 0, -strlen($extensionWithDot)) : $filename;
+            $target = $folder . '/' . $baseName . '_' . date('ymdHis') . $extensionWithDot;
+        }
+        clearstatcache(true, $target);
+        if (is_link($partPath) || !is_file($partPath) || is_link($target) || (file_exists($target) && (!$overwrite || !is_file($target))) || !fm_upload_path_is_safe(FM_ROOT_PATH, $folder, $target)) {
+            @unlink($partPath);
+            $uploadError('Unable to safely finalize the uploaded file.');
+        }
+        if ($overwrite && is_file($target)) {
+            $permissions = @fileperms($target);
+            if ($permissions === false || !@chmod($partPath, $permissions & 0777)) {
                 @unlink($partPath);
-                $uploadError('Unable to safely finalize the uploaded file.');
+                $uploadError('Unable to preserve the destination file permissions.');
             }
         }
-    } else {
-        if (!@move_uploaded_file($tmpName, $fullPath) || !is_file($fullPath) || is_link($fullPath)) {
-            $uploadError('Unable to save the uploaded file.');
+        if (!@rename($partPath, $target)) {
+            @unlink($partPath);
+            $uploadError('Unable to safely finalize the uploaded file.');
         }
     }
 
@@ -1485,6 +1520,11 @@ if (isset($_GET['upload']) && !FM_READONLY) {
                     <input type="hidden" name="p" value="<?php echo fm_enc(FM_PATH) ?>">
                     <input type="hidden" name="fullpath" id="fullpath" value="">
                     <input type="hidden" name="token" value="<?php echo $_SESSION['token']; ?>">
+                    <div class="form-check mb-3 text-start">
+                        <input type="checkbox" class="form-check-input" id="upload-overwrite" aria-describedby="upload-overwrite-help" checked>
+                        <label class="form-check-label" for="upload-overwrite"><?php echo lng('Overwrite existing files') ?></label>
+                        <div class="form-text text-danger" id="upload-overwrite-help"><?php echo lng('When checked, existing files are replaced after upload completes. Changes apply to newly added files.') ?></div>
+                    </div>
                     <div class="fallback">
                         <input name="file" type="file" multiple />
                     </div>
@@ -1521,7 +1561,10 @@ if (isset($_GET['upload']) && !FM_READONLY) {
             maxFilesize: "<?php echo MAX_UPLOAD_SIZE; ?>",
             acceptedFiles: "<?php echo getUploadExt() ?>",
             init: function() {
-                this.on("sending", function(file, xhr, formData) {
+                this.on("addedfile", function(file) {
+                    file.overwriteExisting = document.getElementById("upload-overwrite").checked ? "1" : "0";
+                }).on("sending", function(file, xhr, formData) {
+                    formData.append("overwrite", file.overwriteExisting);
                     let _path = (file.fullPath) ? file.fullPath : file.name;
                     document.getElementById("fullpath").value = _path;
                     xhr.ontimeout = (function() {
@@ -6092,6 +6135,8 @@ function fm_show_header_login()
         $tr['en']['CopyTo']         = 'Copy to';
         $tr['en']['DirectLink']     = 'Direct link';
         $tr['en']['UploadingFiles'] = 'Upload Files';
+        $tr['en']['Overwrite existing files'] = 'Overwrite existing files';
+        $tr['en']['When checked, existing files are replaced after upload completes. Changes apply to newly added files.'] = 'When checked, existing files are replaced after upload completes. Changes apply to newly added files.';
         $tr['en']['ChangePermissions']  = 'Change Permissions';
         $tr['en']['Copying']        = 'Copying';
         $tr['en']['CreateNewItem']  = 'Create New Item';
