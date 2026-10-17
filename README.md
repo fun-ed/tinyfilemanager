@@ -26,6 +26,8 @@ Featuring syntax highlighting for over 150 languages and more than 35 themes, Ti
 
 Tinyfilemanager is highly documented on the [wiki pages](https://github.com/prasathmani/tinyfilemanager/wiki).
 
+See the [FrankenPHP classic benchmark](docs/benchmarks/README.md) for measured latency, throughput and resource use under a one-CPU limit, including the workload and measurement limits.
+
 [![Tiny File Manager](screenshot.gif)](screenshot.gif)
 
 ## Requirements
