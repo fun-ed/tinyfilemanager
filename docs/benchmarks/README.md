@@ -34,6 +34,24 @@ CPU comes from the container cgroup `cpu.stat` usage delta divided by wall time;
 
 Memory is `memory.current`, sampled every 10 ms and at case boundaries. It includes charged page cache and is not the same as Docker stats' working-set display. Samples can miss brief peaks; this is not the container's lifetime memory peak or the RAM needed for uploads and archives. Container healthcheck work is included in cgroup resource counters.
 
+## Loopback deployment boundary
+
+The measured deployment uses a separate, host-networked FrankenPHP container, not the repository's legacy PHP development-server image. Its effective Caddy configuration sets `admin off`, `auto_https off` and `persist_config off` globally. The HTTP site uses `http://:18080` with an explicit `bind 127.0.0.1`; it does not create a listener on all interfaces. Only `/` and `/index.php` reach PHP; other paths return 404.
+
+Disabling the admin API avoids creating an unauthenticated configuration endpoint on the host's loopback interface. Disabling automatic HTTPS avoids automatic certificate management and HTTP-to-HTTPS redirect listeners. No Docker ports are published. Host networking shares the host network namespace and is not network isolation.
+
+The effective configuration and `ss` output were checked after deployment and rechecked during documentation: the service was healthy and its port-18080 listener was exactly `127.0.0.1:18080`. The file-only entry route, immutable code/config and separate managed-data/session mounts are deliberate deployment boundaries, not guarantees that every application file operation is safe.
+
+Useful read-only checks on a Linux deployment host:
+
+```sh
+docker inspect --format '{{.State.Health.Status}} {{.HostConfig.NetworkMode}}' tinyfilemanager-classic
+docker exec tinyfilemanager-classic cat /etc/frankenphp/Caddyfile
+ss -H -ltnp 'sport = :18080'
+```
+
+No service, ingress, DNS or firewall configuration was changed for this documentation update. A future public TLS/reverse-proxy deployment needs a separate review of ingress exposure, trusted forwarded headers and secure cookies.
+
 ## Interpretation and limits
 
 The single-client sample had a 114 ms median server-response time. More concurrent clients did not increase throughput: the application used approximately its full one-CPU allowance, with substantial throttling in the concurrent cases. Keep the present resource limits for occasional administration unless an actual latency or workload requirement calls for another test. This result does not establish that FrankenPHP itself is the expensive part, or that worker mode or RoadRunner would help.
