@@ -1,11 +1,7 @@
 name: PublishDocker
 
 on:
-  push:
-    branches:
-      - 'master'
-    tags:
-      - '**'
+  workflow_dispatch:
 
 jobs:
   docker:

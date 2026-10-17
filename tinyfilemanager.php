@@ -3,14 +3,14 @@
 $CONFIG = '{"lang":"en","error_reporting":false,"show_hidden":false,"hide_Cols":false,"theme":"light"}';
 
 /**
- * H3K ~ Tiny File Manager V2.6
+ * H3K ~ Tiny File Manager V3.0.0
  * @author CCP Programmers
  * @github https://github.com/prasathmani/tinyfilemanager
  * @link https://tinyfilemanager.github.io
  */
 
 //TFM version
-define('VERSION', '2.6');
+define('VERSION', '3.0.0');
 
 //Application Title
 define('APP_TITLE', 'Tiny File Manager');
@@ -1752,7 +1752,7 @@ if (isset($_GET['help'])) {
                 <div class="row">
                     <div class="col-xs-12 col-sm-6">
                         <p>
-                        <h3><a href="https://github.com/prasathmani/tinyfilemanager" target="_blank" class="app-v-title"> <?php echo lng("AppName")." ".VERSION; ?></a></h3>
+                        <h3><a href="https://github.com/fun-ed/tinyfilemanager" target="_blank" class="app-v-title"> <?php echo lng("AppName")." ".VERSION; ?></a></h3>
                         </p>
                         <p><strong><?php echo lng('Author') ?></strong>: PRAŚATH MANİ</p>
                         <p><strong><?php echo lng('Mail Us') ?></strong>: <a href="mailto:ccpprogrammers@gmail.com">ccpprogrammers [at] gmail [dot] com</a></p>
